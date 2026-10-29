@@ -27,6 +27,7 @@ from pathlib import Path
 import control
 
 import settings
+import speedup
 
 import wx
 import wx.adv
@@ -50,12 +51,29 @@ class MainDialog(wx.Dialog, wx.MiniFrame):
     def settings_popup(self):
         """Build the popup menu."""
         menu = wx.Menu()
-        # Replay fast
-        ps = menu.Append(wx.ID_ANY, self.settings_text[0])
+        # Playback speed
+        speed, skip_moves, _ = control.playback_options()
+        speed_menu = wx.Menu()
+        for factor in speedup.SPEEDS:
+            speed_item = speed_menu.AppendRadioItem(wx.ID_ANY, speedup.speed_label(factor))
+            self.Bind(wx.EVT_MENU,
+                      lambda event, factor=factor: control.SettingsCtrl.playback_speed(event, factor),
+                      speed_item)
+            if factor == speed:
+                speed_item.Check(True)
+        menu.AppendSubMenu(speed_menu, self.settings_text[0])
+
+        # Skip intermediate mouse moves
+        sm = menu.AppendCheckItem(wx.ID_ANY, self.text(10, "Skip Mouse Moves"))
+        sm.Check(skip_moves)
         self.Bind(wx.EVT_MENU,
-                  control.SettingsCtrl.playback_speed,
-                  ps)
-        ps.Enable(False)
+                  control.SettingsCtrl.skip_mouse_moves,
+                  sm)
+
+        # Minimum wait between actions
+        self.Bind(wx.EVT_MENU,
+                  control.SettingsCtrl.minimum_wait,
+                  menu.Append(wx.ID_ANY, self.text(11, "Minimum Wait (ms)")))
 
         #  Infinite Playback
         cp = menu.AppendCheckItem(wx.ID_ANY, self.settings_text[1])
@@ -122,6 +140,10 @@ class MainDialog(wx.Dialog, wx.MiniFrame):
                   control.RecordCtrl.mouse_speed,
                   menu.Append(wx.ID_ANY, self.settings_text[9]))
         return menu
+
+    def text(self, index, default):
+        """Return a settings label, older language files may not have it."""
+        return self.settings_text[index] if index < len(self.settings_text) else default
 
     def __init__(self, *args, **kwds):
         """Build the interface."""

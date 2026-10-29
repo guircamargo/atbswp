@@ -5,7 +5,7 @@ Play capture
 Compile to exe
 Preferences
 Help
-Play Speed: Fast
+Playback Speed
 Infinite Playback
 Set Repeat Count
 Recording Hotkey
@@ -15,3 +15,5 @@ Language
 About
 Recording Timer
 Mouse Recording Speed
+Skip Mouse Moves
+Minimum Wait (ms)

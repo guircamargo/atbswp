@@ -59,4 +59,7 @@ except:
         "Language": "en",
         "Recording Timer": 0,
         "Mouse Speed": 21,
+        "Playback Speed": 1,
+        "Skip Mouse Moves": False,
+        "Minimum Wait": 0.05,
     }

@@ -32,6 +32,7 @@ import pyautogui
 from pynput import keyboard, mouse
 
 import settings
+import speedup
 
 from custom_widgets import SliderDialog
 
@@ -40,6 +41,7 @@ import wx.adv
 import wx.lib.newevent as NE
 
 
+WINDOWS = sys.platform == "win32"
 TMP_PATH = os.path.join(tempfile.gettempdir(),
                         "atbswp-" + date.today().strftime("%Y%m%d"))
 HEADER = (
@@ -50,9 +52,31 @@ HEADER = (
     f"import pyautogui\n"
     f"import time\n"
     f"pyautogui.FAILSAFE = False\n"
+    f"{speedup.PAUSE_LINE}\n"
 )
 
 LOOKUP_SPECIAL_KEY = {}
+
+
+def playback_options():
+    """Return (speed, skip mouse moves, minimum wait) from the config."""
+    # Workaround for user upgrading from a previous version
+    try:
+        speed = settings.CONFIG.getfloat('DEFAULT', 'Playback Speed', fallback=1.0)
+        if speed <= 0:
+            speed = 1.0
+    except ValueError:
+        speed = 1.0
+    try:
+        skip_moves = settings.CONFIG.getboolean('DEFAULT', 'Skip Mouse Moves', fallback=False)
+    except ValueError:
+        skip_moves = False
+    try:
+        min_wait = max(0.0, settings.CONFIG.getfloat(
+            'DEFAULT', 'Minimum Wait', fallback=speedup.DEFAULT_MIN_WAIT))
+    except ValueError:
+        min_wait = speedup.DEFAULT_MIN_WAIT
+    return speed, skip_moves, min_wait
 
 
 class FileChooserCtrl:
@@ -215,21 +239,40 @@ class RecordCtrl:
                 self._capture[-1] = engine + "." + move + suffix
         self._capture.append(engine + "." + move + suffix)
 
-    def on_move(self, x, y):
-        """Triggered by a mouse move."""
-        if not self.recording:
-            return False
+    def write_delay(self):
+        """Append the time elapsed since the previous event."""
         b = time.perf_counter()
         timeout = float(b - self.last_time)
         if timeout > 0.0:
             self._capture.append(f"time.sleep({timeout})")
         self.last_time = b
+
+    def remove_stop_trigger(self):
+        """Remove the click/key used to stop the recording."""
+        def pop_action():
+            while len(self._capture) > 1 and self._capture[-1].startswith("time.sleep"):
+                self._capture.pop()
+            if len(self._capture) > 1:
+                return self._capture.pop()
+            return ""
+
+        # The release may not be recorded yet, the press always is
+        if pop_action().startswith(("pyautogui.mouseUp(", "pyautogui.keyUp(")):
+            pop_action()
+
+    def on_move(self, x, y):
+        """Triggered by a mouse move."""
+        if not self.recording:
+            return False
+        self.write_delay()
         self.write_mouse_action(move="moveTo", parameters=f"{x}, {y}")
 
     def on_click(self, x, y, button, pressed):
         """Triggered by a mouse click."""
         if not self.recording:
             return False
+        # Without pyautogui.PAUSE this is what separates mouseDown and mouseUp
+        self.write_delay()
         if pressed:
             if button == mouse.Button.left:
                 self.write_mouse_action(
@@ -259,15 +302,18 @@ class RecordCtrl:
         """Triggered by a mouse wheel scroll."""
         if not self.recording:
             return False
-        self.write_mouse_action(move="scroll", parameters=f"{y}")
+        self.write_delay()
+        # pynput gives wheel notches, pyautogui on Windows expects wheel delta
+        # units (120 per notch) and its hscroll scrolls vertically there
+        if dy:
+            clicks = int(dy * 120) if WINDOWS else int(dy)
+            self.write_mouse_action(move="scroll", parameters=f"{clicks}, {x}, {y}")
+        if dx and not WINDOWS:
+            self.write_mouse_action(move="hscroll", parameters=f"{int(dx)}, {x}, {y}")
 
     def on_press(self, key):
         """Triggered by a key press."""
-        b = time.perf_counter()
-        timeout = float(b - self.last_time)
-        if timeout > 0.0:
-            self._capture.append(f"time.sleep({timeout})")
-        self.last_time = b
+        self.write_delay()
 
         try:
             # Ignore presses on Fn key
@@ -284,6 +330,7 @@ class RecordCtrl:
         if not self.recording:
             return False
         else:
+            self.write_delay()
             if len(str(key)) <= 3:
                 self.write_keyboard_action(move='keyUp', key=key)
             else:
@@ -361,8 +408,7 @@ class RecordCtrl:
             self.recording = False
             with open(TMP_PATH, 'w') as f:
                 # Remove the recording trigger event
-                self._capture.pop()
-                self._capture.pop()
+                self.remove_stop_trigger()
                 f.seek(0)
                 f.write("\n".join(self._capture))
                 f.truncate()
@@ -398,10 +444,15 @@ class PlayCtrl:
     def play(self, capture, toggle_button):
         """Play the loaded capture."""
         toggle_value = True
-        for line in capture:
-            if self.play_thread.ended():
-                return
-            exec(line)
+        pause = pyautogui.PAUSE
+        try:
+            for line in capture:
+                if self.play_thread.ended():
+                    return
+                exec(line)
+        finally:
+            # New captures set the pause to 0, don't let it leak into old ones
+            pyautogui.PAUSE = pause
 
         if self.count <= 0 and not self.infinite:
             toggle_value = False
@@ -431,6 +482,9 @@ class PlayCtrl:
                 return
             with open(TMP_PATH, 'r') as f:
                 capture = f.readlines()
+            speed, skip_moves, min_wait = playback_options()
+            if speed != 1 or skip_moves:
+                capture = speedup.transform(capture, speed, skip_moves, min_wait)
             if self.count > 0 or self.infinite:
                 self.count = self.count - 1 if not self.infinite else self.count
                 self.play_thread = PlayThread()
@@ -484,10 +538,28 @@ class SettingsCtrl:
         self.main_dialog = main_dialog
 
     @staticmethod
-    def playback_speed(event):
-        """Replay the capture 2 times faster."""
-        # TODO: To implement
-        pass
+    def playback_speed(event, speed):
+        """Set the playback speed factor (only affects the replay)."""
+        settings.CONFIG['DEFAULT']['Playback Speed'] = str(speed)
+        settings.save_config()
+
+    @staticmethod
+    def skip_mouse_moves(event):
+        """Toggle replaying only the last mouse position before each action."""
+        current_value = playback_options()[1]
+        settings.CONFIG['DEFAULT']['Skip Mouse Moves'] = str(not current_value)
+        settings.save_config()
+
+    @staticmethod
+    def minimum_wait(event):
+        """Set the minimum wait between actions of an accelerated playback."""
+        current_value = int(playback_options()[2] * 1000)
+        dialog = wx.NumberEntryDialog(None, message="Minimum wait between actions (milliseconds)",
+                                      prompt="", caption="Minimum Wait", value=current_value, min=0, max=5000)
+        if dialog.ShowModal() == wx.ID_OK:
+            settings.CONFIG['DEFAULT']['Minimum Wait'] = str(dialog.Value / 1000)
+            settings.save_config()
+        dialog.Destroy()
 
     @staticmethod
     def infinite_playback(event):
